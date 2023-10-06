@@ -1,0 +1,16 @@
+.dub
+docs.json
+__dummy.html
+docs/
+/yi
+yi.so
+yi.dylib
+yi.dll
+yi.a
+yi.lib
+yi-test-*
+*.exe
+*.pdb
+*.o
+*.obj
+*.lst
