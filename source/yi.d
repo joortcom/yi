@@ -65,7 +65,7 @@ static assert(Symbol.sizeof == 8);
 
 
 // alias Value = SumType!(Bool, Int, Double, List, Obj, Symbol);
-enum : ubyte {BOOL, INT, DOUBLE, OBJECT, ARRAY, STRING, SYMBOL, PROC}
+enum : ubyte {BOOL, INT, DOUBLE, OBJECT, ARRAY, STRING, SYMBOL, PROC, BUILTIN}
 struct Value {  // tagged union! TODO: shall we just use boxed class type Int Double String?
   ubyte tag;
   union {
@@ -78,6 +78,7 @@ struct Value {  // tagged union! TODO: shall we just use boxed class type Int Do
     String str;
     Symbol sym;
     Procedure proc;  // callable
+    Builtin   builtin;
   }
 }
 
@@ -216,6 +217,31 @@ AliasSeq!(_append, _cons, _let) = symbolize(
 }
 
 
+abstract class Builtin {
+  abstract Cell call(Cell[] args);
+}
+
+class Add : Builtin {
+  int arity;
+  this(int arity) {  // , int delegate(int,int) doer)
+    this.arity = arity;
+  }
+
+  Value result;  // NOTE: assume no multithread for now
+  override Cell call(Cell[] args) {
+    enforce(args.length == arity);  // no partial call for now
+    result.tag = INT;
+    result.iVal = args[0].iVal + args[1].iVal;
+    return &result;
+  }
+}
+
+Cell newAdd() {
+  Builtin builtin = new Add(2);
+  Cell result = new Value(BUILTIN);  // on the heap
+  result.builtin = builtin;
+  return result;
+}
 
 class Procedure {
     // "A user-defined Scheme procedure.", including macro!
@@ -328,6 +354,7 @@ Cell read(InPortT)(InPortT inport) {
                   Cell result = new Value();  // heap allocated
 		  read_ahead(token, result);
 		  appendList(collector, result);
+                  // writeln("read_ahead: ", to_string(collector), to_string(result));
 		}
 	    }
 	}
@@ -347,6 +374,7 @@ Cell read(InPortT)(InPortT inport) {
       result = new Value();  // heap allocated
       read_ahead(token1, result);
     }
+    // writeln("read: ", to_string(result));
     return result;
 }
 static Symbol[string] quotes;
@@ -388,6 +416,8 @@ static string to_string(ref Value x) {
     else if(isa(x, str): return '"%s"' % x.encode('unicode-escape').decode("utf8").replace('"',r'\"')
     else if(isa(x, complex): return str(x).replace('j', 'i')
     */
+    case PROC:    result = "Procedure: "; break;
+    case BUILTIN: result = "Builtin: "; break;
     default: enforce(false);
   }
   // writeln(result);
@@ -398,6 +428,8 @@ static string to_string(Cell x) {
   return to_string(*x);
 }
 
+static string to_string(Symbol[] args) { return join(map!(x => x.toString)   (args), " "); }
+static string to_string(  Cell[] args) { return join(map!(x =>  to_string(x))(args), " "); }
 
 void load(string filename) {
     // "Eval every expression from a file."
@@ -419,8 +451,6 @@ void repl(FileT)(string prompt, FileT inport, File outs=stdout) {
     }
 }
 // ################ Environment class
-static string to_string(Symbol[] args) { return join(map!(x => x.toString)   (args), " "); }
-static string to_string(  Cell[] args) { return join(map!(x =>  to_string(x))(args), " "); }
 
 static class Env {
     // "An environment: a dict of {'var':val} pairs, with an outer Env."
@@ -444,7 +474,7 @@ static class Env {
     Env find(Symbol var) {
         // "Find the innermost Env where var appears."
         if (var in this.dict) return this;
-	else if (this.outer is null)  {throw new LookupError(var.value);}
+	else if (this.outer is null)  {throw new LookupError("undefined function (Symbol): " ~ var.value);}
         else return this.outer.find(var);
     }
 }
@@ -483,6 +513,7 @@ static Env add_globals(Env self) {
      'read':read, 'write':lambda x,port=sys.stdout:port.write(to_string(x)),
      'display':lambda x,port=sys.stdout:port.write(x if isa(x,str) else to_string(x))})
      */
+    self.dict[Sym("+")] = newAdd();
     return self;
 }
 // isa = isinstance;
@@ -541,16 +572,23 @@ Cell eval(Cell x, Env env=global_env) {
             x = &(x.arr[$-1]);           // NOTE: x will be eval-ed (and return) in the while loop's next itr
         } else {                   // (proc exp*)
             Cell[] exps;
-	    foreach (exp; x.arr) exps ~= eval(&exp, env);
-            Cell proc = exps[0];  exps.popFront();
-            if (typeid(proc) == typeid(Procedure)) {  // user defined lisp Procedure
-                Procedure prc = cast(Procedure)proc;
+	    foreach (ref exp; x.arr) {  // NOTE: have to use `ref`, do NOT copy the struct!
+		    Cell v = eval(&exp, env);
+		    exps ~= v;
+                    writeln("exps ", to_string(exp), " -> ", to_string(v), " ==> ", to_string(exps));
+	    }
+            Cell proc = exps[0];  exps = exps[1 .. $];
+            if (typeid(proc.proc) == typeid(Procedure)) {  // user defined lisp Procedure
+                Procedure prc = cast(Procedure)proc.proc;
                 x = prc.exp;
                 env = new Env(prc.parms, exps, prc.env);  // NOTE: will continue the while loop to eval with proc.env as outer env! *new* scope for the call, funcall cost
 	    } else {
                 // TODO: return proc(exps); // native buildin or foreign D-func
-                writeln("native call:", to_string(proc), to_string(exps));
-		return null;
+                writeln("native call ", to_string(proc), to_string(exps));
+		Builtin bi = cast(Builtin)proc.builtin;
+                enforce(bi);
+		Cell result = bi.call(exps);
+		return result;
 	    }
 	}
       }
@@ -564,10 +602,10 @@ static Cell expand(ref Value x, bool toplevel=false) {
 
 static Cell expand(Cell x, bool toplevel=false) {
   // "Walk tree of x, making optimizations/fixes, and signaling SyntaxError."
-  require(x, x.arr.values != []);                    // () => Error
   if (x.tag != ARRAY) {                 // constant => unchanged
       return x;
   } else {
+    require(x, x.arr.values != []);       // () => Error
     Symbol head = x.arr[0].sym;
     if (head is _quote) {                 // (quote exp)
         require(x, x.arr.length==2);
